@@ -1,0 +1,28 @@
+name: Load shared CI environment
+description: Load Infisical production variables using GitHub OIDC without connecting Tailscale.
+runs:
+  using: composite
+  steps:
+    - name: Check caller
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: python3 "$ACTION_PATH/../scripts/ci_context.py"
+    - name: Load shared environment from Infisical
+      uses: Infisical/secrets-action@8a06c1bdcd5b8635d510c52d4b57a92c1ccef785 # v1.0.9
+      with:
+        method: oidc
+        identity-id: 8d988eed-4b7b-460a-a1c9-1b682b1e2336
+        oidc-audience: github-ci
+        project-slug: github-ci
+        env-slug: prod
+        secret-path: /
+        domain: https://app.infisical.com
+        export-type: env
+        include-imports: "false"
+        recursive: "false"
+    - name: Validate registry settings
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: python3 "$ACTION_PATH/../scripts/ci_context.py" --settings
