@@ -32,6 +32,49 @@ jobs:
 최소화하도록 빌드를 먼저 한다. 베이스 이미지가 사설 레지스트리에 있으면 빌드 전에 로그인해야 한다.
 이 액션은 빌드, push 또는 Kubernetes 배포를 자동 실행하지 않는다.
 
+## 같은 job에서 환경변수 재사용
+
+**이 액션을 호출한 뒤에는 같은 job의 이후 step에서 Infisical Secret을 환경변수로 사용할 수 있다.**
+`uses` 자체의 기능이 아니라, 내부 Infisical 액션을 `export-type: env`로 실행하기 때문이다.
+`github-ci` 프로젝트의 `prod` 환경에서 루트(`/`) Secret을 모두 가져오며, 하위 폴더와 import는 포함하지 않는다.
+
+예를 들어 루트에 `DOCKER_REGISTRY_PASSWORD`와 `MANIFEST_UPDATE_TOKEN`을 저장했다면,
+공통 액션을 한 번 호출한 후 두 값을 모두 사용할 수 있다. 별도의 output 연결이나 GitHub Secret 등록은 필요 없다.
+
+| 사용하는 위치 | 참조 방법 |
+| --- | --- |
+| 이후 `run` step의 Bash | `$MANIFEST_UPDATE_TOKEN` |
+| 이후 액션의 `with` 입력 | `${{ env.MANIFEST_UPDATE_TOKEN }}` |
+| GitHub Secrets | `${{ secrets.MANIFEST_UPDATE_TOKEN }}`로 자동 등록되지는 않음 |
+
+기존 태그 workflow의 `jobs` 아래에 두는 GitOps job 예제:
+
+```yaml
+update-gitops-manifest:
+  runs-on: ubuntu-latest
+  permissions:
+    contents: read
+    id-token: write
+  steps:
+    - name: Load shared CI environment and login
+      uses: saturn30/registry-login-action@v1
+
+    - name: Checkout infrastructure repository
+      uses: actions/checkout@v4
+      with:
+        repository: appppps/netcup-infra
+        token: ${{ env.MANIFEST_UPDATE_TOKEN }}
+        path: netcup-infra
+
+    # 이후 step에서 매니페스트 수정·커밋·push를 수행한다.
+```
+
+- 환경변수는 액션 호출 이후 같은 job에서만 유지된다. `needs`로 연결해도 다른 job에 전달되지 않으므로 그 job에서도 액션을 호출한다.
+- 다음 workflow 실행에서는 Infisical 값을 다시 가져온다. 실행 중 값이 자동 갱신되거나 runner 밖에 영구 저장되는 것은 아니다.
+- 이 액션을 호출하는 job에는 루트의 모든 Secret이 전달된다. `MANIFEST_UPDATE_TOKEN`도 예외가 아니다.
+- 환경변수가 필요한 job에서도 현재 액션을 호출하면 Tailscale 연결과 Docker 로그인까지 함께 수행한다. 호출 조건은 아래와 동일하다.
+- Secret 값을 확인하려고 `echo`나 `printenv`로 출력하지 않는다.
+
 ## 호출 조건
 
 - Linux runner에서 Docker CLI/daemon을 사용할 수 있어야 한다.
