@@ -1,54 +1,83 @@
-name: Verify registry authentication
+name: Verify shared registry and GitOps actions
 on:
   workflow_dispatch:
-    inputs:
-      verify-gitops:
-        description: Verify the Infisical GitOps token with checkout and push dry-run
-        type: boolean
-        default: false
-
 permissions:
   contents: read
   id-token: write
-
 jobs:
   verify:
     if: github.repository_owner == 'saturn30' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      TEST_BRANCH: codex/verify-common-ci-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Login with the action under test
-        id: registry
+      - name: Run regression tests
+        run: |
+          python3 -m venv "$RUNNER_TEMP/action-tests"
+          "$RUNNER_TEMP/action-tests/bin/pip" install -q -r update-manifests/requirements.txt
+          "$RUNNER_TEMP/action-tests/bin/python" -m unittest discover -s tests -v
+      - name: Load variables without Tailscale
+        uses: ./load-env
+      - name: Login using the loaded host
         uses: ./
-      - name: Inspect existing image manifest
-        if: ${{ !inputs.verify-gitops }}
+      - name: Create isolated GitOps test branch
+        id: branch
         env:
-          REGISTRY: ${{ steps.registry.outputs.registry }}
+          GH_TOKEN: ${{ env.MANIFEST_UPDATE_TOKEN }}
         run: |
-          docker manifest inspect "$REGISTRY/verification/cuda:13.3.1-cudnn-runtime-ubuntu24.04-amd64" > /dev/null
-          echo 'PASS: OIDC authentication, Tailscale connectivity, registry login and manifest access'
-      - name: Check GitOps credential type
-        if: inputs.verify-gitops
-        shell: bash
-        run: |
-          case "${MANIFEST_UPDATE_TOKEN:-}" in
-            github_pat_*) echo 'GitOps token type: fine-grained PAT' ;;
-            ghp_*) echo 'GitOps token type: classic PAT' ;;
-            '') echo 'MANIFEST_UPDATE_TOKEN is missing from Infisical.' >&2; exit 1 ;;
-            *) echo 'GitOps token type: other' ;;
-          esac
-      - name: Checkout GitOps repository
-        if: inputs.verify-gitops
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+          sha=$(gh api repos/bluesoft9999/netcup-infra/git/ref/heads/main --jq .object.sha)
+          gh api --method POST repos/bluesoft9999/netcup-infra/git/refs \
+            -f ref="refs/heads/$TEST_BRANCH" -f sha="$sha" > /dev/null
+          echo "base=$sha" >> "$GITHUB_OUTPUT"
+      - name: Update manifests on the isolated branch
+        uses: ./update-manifests
         with:
-          repository: bluesoft9999/netcup-infra
-          token: ${{ env.MANIFEST_UPDATE_TOKEN }}
-          path: gitops-check
-      - name: Verify GitOps push authentication without writing
-        if: inputs.verify-gitops
-        working-directory: gitops-check
-        shell: bash
+          branch: ${{ env.TEST_BRANCH }}
+          manifest-path: argo/manifests/lol-stat
+          images: |
+            ${{ env.DOCKER_REGISTRY_HOST }}/saturn30/lol-stat/web
+            ${{ env.DOCKER_REGISTRY_HOST }}/saturn30/lol-stat/server
+            ${{ env.DOCKER_REGISTRY_HOST }}/saturn30/lol-stat/ingest
+      - name: Check changed files
+        id: changed
+        env:
+          GH_TOKEN: ${{ env.MANIFEST_UPDATE_TOKEN }}
+          BASE: ${{ steps.branch.outputs.base }}
         run: |
-          git push --dry-run origin "HEAD:refs/heads/codex/verify-registry-login-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          echo 'PASS: GitOps checkout and push dry-run; no refs or manifests changed'
+          gh api "repos/bluesoft9999/netcup-infra/compare/$BASE...$TEST_BRANCH" \
+            --jq '[.files[].filename] | sort' > "$RUNNER_TEMP/changed-files.json"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          actual = json.loads((Path(os.environ['RUNNER_TEMP']) / 'changed-files.json').read_text())
+          expected = sorted('argo/manifests/lol-stat/' + name for name in [
+              'web.deploy.yaml', 'server.deploy.yaml', 'ingest-daemon.deploy.yaml', 'server.prisma-migrate.job.yaml'])
+          assert actual == expected, actual
+          print('PASS: exactly the four intended workloads changed')
+          PY
+          sha=$(gh api "repos/bluesoft9999/netcup-infra/git/ref/heads/$TEST_BRANCH" --jq .object.sha)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Repeat the same update
+        uses: ./update-manifests
+        with:
+          branch: ${{ env.TEST_BRANCH }}
+          manifest-path: argo/manifests/lol-stat
+          images: |
+            ${{ env.DOCKER_REGISTRY_HOST }}/saturn30/lol-stat/web
+            ${{ env.DOCKER_REGISTRY_HOST }}/saturn30/lol-stat/server
+            ${{ env.DOCKER_REGISTRY_HOST }}/saturn30/lol-stat/ingest
+      - name: Verify no duplicate commit
+        env:
+          GH_TOKEN: ${{ env.MANIFEST_UPDATE_TOKEN }}
+          EXPECTED_SHA: ${{ steps.changed.outputs.sha }}
+        run: |
+          actual=$(gh api "repos/bluesoft9999/netcup-infra/git/ref/heads/$TEST_BRANCH" --jq .object.sha)
+          test "$actual" = "$EXPECTED_SHA"
+          echo 'PASS: no duplicate commit; production main was not changed'
+      - name: Remove isolated test branch
+        if: always() && steps.branch.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ env.MANIFEST_UPDATE_TOKEN }}
+        run: gh api --method DELETE "repos/bluesoft9999/netcup-infra/git/refs/heads/$TEST_BRANCH"

@@ -1,0 +1,67 @@
+name: Update GitOps manifests
+description: Update selected container image tags and commit and push the changes to the infrastructure repository.
+inputs:
+  manifest-path:
+    description: Directory of tracked Kubernetes YAML manifests inside the infrastructure repository
+    required: true
+  images:
+    description: Fully qualified image names without tags, one per line
+    required: true
+  repository:
+    description: Infrastructure repository
+    default: bluesoft9999/netcup-infra
+  branch:
+    description: Infrastructure branch
+    default: main
+runs:
+  using: composite
+  steps:
+    - name: Check inputs and prepare checkout
+      id: paths
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        python3 "$ACTION_PATH/../scripts/ci_context.py"
+        if [ -z "${MANIFEST_UPDATE_TOKEN:-}" ]; then
+          echo 'MANIFEST_UPDATE_TOKEN is missing; run load-env first.' >&2
+          exit 1
+        fi
+        repo_dir=$(mktemp -d "$GITHUB_WORKSPACE/.registry-gitops.XXXXXX")
+        echo "repo-dir=$repo_dir" >> "$GITHUB_OUTPUT"
+    - name: Checkout infrastructure repository
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      with:
+        repository: ${{ inputs.repository }}
+        ref: ${{ inputs.branch }}
+        token: ${{ env.MANIFEST_UPDATE_TOKEN }}
+        path: ${{ steps.paths.outputs.repo-dir }}
+        fetch-depth: 0
+    - name: Update manifests and publish changes
+      shell: bash
+      working-directory: ${{ steps.paths.outputs.repo-dir }}
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        MANIFEST_PATH: ${{ inputs.manifest-path }}
+        IMAGES: ${{ inputs.images }}
+        BRANCH: ${{ inputs.branch }}
+        TAG: ${{ github.ref_name }}
+      run: |
+        venv_dir=$(mktemp -d "$RUNNER_TEMP/manifest-python.XXXXXX")
+        trap 'rm -rf "$venv_dir"' EXIT
+        python3 -m venv "$venv_dir"
+        "$venv_dir/bin/pip" install --disable-pip-version-check -q -r "$ACTION_PATH/requirements.txt"
+        "$venv_dir/bin/python" "$ACTION_PATH/update_images.py" . "$MANIFEST_PATH" "$TAG"
+        if git diff --cached --quiet; then
+          echo 'No manifest changes.'
+          exit 0
+        fi
+        git config user.name 'github-actions[bot]'
+        git config user.email 'github-actions[bot]@users.noreply.github.com'
+        git commit -m "Update $MANIFEST_PATH images to $TAG"
+        for attempt in 1 2 3; do
+          if git push origin "HEAD:refs/heads/$BRANCH"; then exit 0; fi
+          if [ "$attempt" -lt 3 ]; then git pull --rebase origin "$BRANCH"; fi
+        done
+        echo 'Failed to push manifest changes.' >&2
+        exit 1
