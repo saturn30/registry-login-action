@@ -1,6 +1,11 @@
 name: Verify registry authentication
 on:
   workflow_dispatch:
+    inputs:
+      verify-gitops:
+        description: Verify the Infisical GitOps token with checkout and push dry-run
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -22,3 +27,27 @@ jobs:
         run: |
           docker manifest inspect "$REGISTRY/verification/cuda:13.3.1-cudnn-runtime-ubuntu24.04-amd64" > /dev/null
           echo 'PASS: OIDC authentication, Tailscale connectivity, registry login and manifest access'
+      - name: Check GitOps credential type
+        if: inputs.verify-gitops
+        shell: bash
+        run: |
+          case "${MANIFEST_UPDATE_TOKEN:-}" in
+            github_pat_*) echo 'GitOps token type: fine-grained PAT' ;;
+            ghp_*) echo 'GitOps token type: classic PAT' ;;
+            '') echo 'MANIFEST_UPDATE_TOKEN is missing from Infisical.' >&2; exit 1 ;;
+            *) echo 'GitOps token type: other' ;;
+          esac
+      - name: Checkout GitOps repository
+        if: inputs.verify-gitops
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: bluesoft9999/netcup-infra
+          token: ${{ env.MANIFEST_UPDATE_TOKEN }}
+          path: gitops-check
+      - name: Verify GitOps push authentication without writing
+        if: inputs.verify-gitops
+        working-directory: gitops-check
+        shell: bash
+        run: |
+          git push --dry-run origin "HEAD:refs/heads/codex/verify-registry-login-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo 'PASS: GitOps checkout and push dry-run; no refs or manifests changed'

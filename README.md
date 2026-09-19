@@ -62,7 +62,7 @@ update-gitops-manifest:
     - name: Checkout infrastructure repository
       uses: actions/checkout@v4
       with:
-        repository: appppps/netcup-infra
+        repository: bluesoft9999/netcup-infra
         token: ${{ env.MANIFEST_UPDATE_TOKEN }}
         path: netcup-infra
 
@@ -122,3 +122,9 @@ gh workflow run verify.yml --repo saturn30/registry-login-action --ref v1
 
 검증은 실제 Infisical OIDC, Tailscale 연결, Docker 로그인 및 기존 이미지 manifest 조회를 수행한다.
 테스트 이미지 verification/cuda가 레지스트리에 있어야 한다. 이미지를 생성하거나 삭제하지 않는다.
+
+GitOps 토큰도 확인하려면 `verify-gitops` 입력을 포함한 최신 workflow가 들어 있는 `v*` 태그에서
+해당 입력을 `true`로 실행한다. Infisical의 `MANIFEST_UPDATE_TOKEN`으로
+`bluesoft9999/netcup-infra` checkout과 `git push --dry-run`을 확인한다.
+토큰 값은 출력하지 않으며 실제 브랜치 생성·매니페스트 변경·배포는 수행하지 않는다.
+dry-run은 push 인증 확인이며, main 브랜치 보호 규칙을 통과하는 실제 쓰기까지 검증한 것은 아니다.
