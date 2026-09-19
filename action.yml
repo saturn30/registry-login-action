@@ -1,0 +1,82 @@
+name: Registry login
+description: Authenticate with Infisical and Tailscale using GitHub OIDC, then log in to the private container registry.
+
+outputs:
+  registry:
+    description: Registry hostname for image names
+    value: registry.deer-deneb.ts.net
+
+runs:
+  using: composite
+  steps:
+    - name: Check caller and select Tailscale identity
+      id: identity
+      shell: bash
+      env:
+        OWNER: ${{ github.repository_owner }}
+        REF: ${{ github.ref }}
+        RUNNER_PLATFORM: ${{ runner.os }}
+      run: |
+        if [ "$RUNNER_PLATFORM" != Linux ]; then
+          echo 'This action requires a Linux runner.' >&2
+          exit 1
+        fi
+        case "$REF" in
+          refs/tags/v*) ;;
+          *) echo 'OIDC authentication requires a v* tag ref.' >&2; exit 1 ;;
+        esac
+        case "$OWNER" in
+          saturn30) client_id='Tp211JVNe211CNTRL-kEXytXFUZC21CNTRL' ;;
+          bluesoft9999) client_id='Tp211JVNe211CNTRL-kVRUeu2Wr111CNTRL' ;;
+          *) echo 'Repository owner is not allowed.' >&2; exit 1 ;;
+        esac
+        echo "client-id=$client_id" >> "$GITHUB_OUTPUT"
+        echo "audience=api.tailscale.com/$client_id" >> "$GITHUB_OUTPUT"
+
+    - name: Load registry password from Infisical
+      uses: Infisical/secrets-action@8a06c1bdcd5b8635d510c52d4b57a92c1ccef785 # v1.0.9
+      with:
+        method: oidc
+        identity-id: 8d988eed-4b7b-460a-a1c9-1b682b1e2336
+        oidc-audience: github-ci
+        project-slug: github-ci
+        env-slug: prod
+        secret-path: /
+        domain: https://app.infisical.com
+        export-type: env
+        include-imports: "false"
+        recursive: "false"
+
+    - name: Check registry credential
+      shell: bash
+      run: |
+        if [ -z "${DOCKER_REGISTRY_PASSWORD:-}" ]; then
+          echo 'DOCKER_REGISTRY_PASSWORD is missing from Infisical github-ci/prod.' >&2
+          exit 1
+        fi
+
+    - name: Connect to Tailscale
+      uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+      with:
+        oauth-client-id: ${{ steps.identity.outputs.client-id }}
+        audience: ${{ steps.identity.outputs.audience }}
+        tags: tag:ci-registry
+
+    - name: Wait for registry connectivity
+      shell: bash
+      run: |
+        for attempt in {1..30}; do
+          status=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 5 \
+            https://registry.deer-deneb.ts.net/v2/ || true)
+          if [ "$status" = 401 ]; then exit 0; fi
+          sleep 2
+        done
+        echo 'Registry connectivity check failed.' >&2
+        exit 1
+
+    - name: Login to registry
+      uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+      with:
+        registry: registry.deer-deneb.ts.net
+        username: ci-push
+        password: ${{ env.DOCKER_REGISTRY_PASSWORD }}
