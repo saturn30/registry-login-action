@@ -125,6 +125,7 @@ gh workflow run verify.yml --repo saturn30/registry-login-action --ref v1
 
 GitOps 토큰도 확인하려면 `verify-gitops` 입력을 포함한 최신 workflow가 들어 있는 `v*` 태그에서
 해당 입력을 `true`로 실행한다. Infisical의 `MANIFEST_UPDATE_TOKEN`으로
-`bluesoft9999/netcup-infra` checkout과 `git push --dry-run`을 확인한다.
+`bluesoft9999/netcup-infra` checkout과 `git push --dry-run`을 확인한다. 이 모드에서는
+기존 CUDA 테스트 이미지 조회를 건너뛰므로 해당 이미지의 보존 여부에 의존하지 않는다.
 토큰 값은 출력하지 않으며 실제 브랜치 생성·매니페스트 변경·배포는 수행하지 않는다.
 dry-run은 push 인증 확인이며, main 브랜치 보호 규칙을 통과하는 실제 쓰기까지 검증한 것은 아니다.
