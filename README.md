@@ -1,131 +1,126 @@
-# Registry login action
+# Registry login and GitOps actions
 
-GitHub OIDC로 Infisical에서 비밀번호를 가져오고, Tailscale에 연결한 뒤 사설 컨테이너 레지스트리에 로그인한다.
-각 앱은 이미지 빌드 후 이 액션을 호출하고 같은 job에서 docker push를 실행하면 된다.
-GitHub Secret이나 Infisical 접속용 고정 토큰을 레포마다 등록할 필요가 없다.
+Infisical의 `github-ci / prod / /`를 공통 CI 환경으로 사용한다. 앱마다 GitHub Secret을 등록하지 않는다.
 
-## 사용
+| 호출 | 역할 |
+| --- | --- |
+| `saturn30/registry-login-action/load-env@v1` | 환경변수만 로딩. Tailscale·Docker 로그인 없음 |
+| `saturn30/registry-login-action@v1` | Tailscale 연결과 Docker 로그인. 환경변수가 없으면 먼저 로딩 |
+| `saturn30/registry-login-action/update-manifests@v1` | 이미지 태그 갱신·커밋·push. 앞에서 load-env 호출 필요 |
+
+## 이미지 게시
+
+주소는 Infisical의 `DOCKER_REGISTRY_HOST`에서 읽는다. 값은 `https://`나 경로 없이 호스트만 저장한다.
 
 ```yaml
 name: Publish image
 on:
   push:
     tags: ['v*']
-
 permissions:
   contents: read
   id-token: write
-
 jobs:
   publish:
     runs-on: ubuntu-latest
-    env:
-      IMAGE: registry.deer-deneb.ts.net/my-app:${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
+      - uses: saturn30/registry-login-action/load-env@v1
+      - name: Set image name
+        env:
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: echo "IMAGE=$DOCKER_REGISTRY_HOST/${REPOSITORY,,}:$TAG" >> "$GITHUB_ENV"
       - run: docker build --tag "$IMAGE" .
       - uses: saturn30/registry-login-action@v1
       - run: docker push "$IMAGE"
 ```
 
-`my-app`과 Dockerfile 위치는 앱에 맞춰 변경한다. 인증에 시간이 걸리는 동안 Tailscale이 연결된 상태를
-최소화하도록 빌드를 먼저 한다. 베이스 이미지가 사설 레지스트리에 있으면 빌드 전에 로그인해야 한다.
-이 액션은 빌드, push 또는 Kubernetes 배포를 자동 실행하지 않는다.
+빌드 중에는 Tailscale에 연결하지 않는다. 로그인 액션은 이미 로딩된 host/password가 있으면 Infisical을 다시 호출하지 않는다.
+사설 베이스 이미지가 필요하면 빌드 전에 로그인한다. 기존처럼 루트 액션만 호출하는 방식도 계속 지원한다.
+루트 액션의 `registry` output은 Infisical에서 읽은 호스트다.
 
-## 같은 job에서 환경변수 재사용
+## 이미지 게시 후 배포
 
-**이 액션을 호출한 뒤에는 같은 job의 이후 step에서 Infisical Secret을 환경변수로 사용할 수 있다.**
-`uses` 자체의 기능이 아니라, 내부 Infisical 액션을 `export-type: env`로 실행하기 때문이다.
-`github-ci` 프로젝트의 `prod` 환경에서 루트(`/`) Secret을 모두 가져오며, 하위 폴더와 import는 포함하지 않는다.
-
-예를 들어 루트에 `DOCKER_REGISTRY_PASSWORD`와 `MANIFEST_UPDATE_TOKEN`을 저장했다면,
-공통 액션을 한 번 호출한 후 두 값을 모두 사용할 수 있다. 별도의 output 연결이나 GitHub Secret 등록은 필요 없다.
-
-| 사용하는 위치 | 참조 방법 |
-| --- | --- |
-| 이후 `run` step의 Bash | `$MANIFEST_UPDATE_TOKEN` |
-| 이후 액션의 `with` 입력 | `${{ env.MANIFEST_UPDATE_TOKEN }}` |
-| GitHub Secrets | `${{ secrets.MANIFEST_UPDATE_TOKEN }}`로 자동 등록되지는 않음 |
-
-기존 태그 workflow의 `jobs` 아래에 두는 GitOps job 예제:
+이미지를 모두 게시한 job 뒤에 다음 job을 둔다. `needs`의 job 이름과 앱 경로·이미지 목록만 맞춘다.
 
 ```yaml
-update-gitops-manifest:
+deploy:
+  needs: publish
   runs-on: ubuntu-latest
   permissions:
     contents: read
     id-token: write
   steps:
-    - name: Load shared CI environment and login
-      uses: saturn30/registry-login-action@v1
-
-    - name: Checkout infrastructure repository
-      uses: actions/checkout@v4
+    - uses: saturn30/registry-login-action/load-env@v1
+    - uses: saturn30/registry-login-action/update-manifests@v1
       with:
-        repository: bluesoft9999/netcup-infra
-        token: ${{ env.MANIFEST_UPDATE_TOKEN }}
-        path: netcup-infra
-
-    # 이후 step에서 매니페스트 수정·커밋·push를 수행한다.
+        manifest-path: argo/manifests/my-app
+        images: |
+          ${{ env.DOCKER_REGISTRY_HOST }}/saturn30/my-app
 ```
 
-- 환경변수는 액션 호출 이후 같은 job에서만 유지된다. `needs`로 연결해도 다른 job에 전달되지 않으므로 그 job에서도 액션을 호출한다.
-- 다음 workflow 실행에서는 Infisical 값을 다시 가져온다. 실행 중 값이 자동 갱신되거나 runner 밖에 영구 저장되는 것은 아니다.
-- 이 액션을 호출하는 job에는 루트의 모든 Secret이 전달된다. `MANIFEST_UPDATE_TOKEN`도 예외가 아니다.
-- 환경변수가 필요한 job에서도 현재 액션을 호출하면 Tailscale 연결과 Docker 로그인까지 함께 수행한다. 호출 조건은 아래와 동일하다.
-- Secret 값을 확인하려고 `echo`나 `printenv`로 출력하지 않는다.
+이 job은 GitHub와 Infisical만 사용한다. Tailscale·Docker에 연결하지 않는다.
+별도 deploy 입력이나 활성화 변수 없이 이미지 게시 성공 후 GitOps 갱신을 실행한다.
 
-## 호출 조건
-
-- Linux runner에서 Docker CLI/daemon을 사용할 수 있어야 한다.
-- 호출 workflow에 `id-token: write` 권한이 필요하다.
-- 호출하는 앱 저장소의 owner는 `saturn30` 또는 `bluesoft9999`다.
-- 실행 ref는 `refs/tags/v*`여야 한다. 이벤트 종류는 검사하지 않으므로 해당 태그를 대상으로 수동 실행해도 된다.
-- 호출한 job 종료 시 Docker login/Tailscale 액션의 post 처리로 로그아웃한다.
-- 다른 job으로 넘어가면 인증 상태가 전달되지 않는다. 그 job에서도 액션을 호출한다.
-
-## 중앙 설정
-
-| 항목 | 값 |
+| 입력 | 값 |
 | --- | --- |
-| 레지스트리 | registry.deer-deneb.ts.net |
-| 레지스트리 계정 | ci-push |
-| Infisical 프로젝트 / 환경 / 경로 | github-ci / prod / / |
-| 비밀번호 키 | DOCKER_REGISTRY_PASSWORD |
-| Infisical Identity ID | 8d988eed-4b7b-460a-a1c9-1b682b1e2336 |
-| Infisical Audience | github-ci |
-| Tailscale 태그 | tag:ci-registry |
+| `manifest-path` | 인프라 저장소 안의 매니페스트 디렉터리. 필수 |
+| `images` | 레지스트리를 포함한 **태그 없는 전체 이미지 이름**, 줄마다 하나. 필수 |
+| `repository` | 기본 `bluesoft9999/netcup-infra` |
+| `branch` | 기본 `main` |
 
-Tailscale Client ID와 Audience는 호출 저장소의 owner에 따라 action.yml에서 자동 선택한다.
-Infisical과 Tailscale의 서버 측 OIDC 설정에도 owner 및 ref 제한이 있어야 한다.
-액션의 사전 검사는 서버 측 권한 검사를 대신하지 않는다.
+태그는 호출한 workflow의 Git 태그에서 자동으로 가져온다. 예를 들어 `v1.2.3` 실행은 각 이미지를 `:v1.2.3`으로 갱신한다.
+Python 설치 환경과 YAML 파서는 액션이 준비한다. 앱에 스크립트·requirements를 복사할 필요가 없다.
 
-이 저장소에는 공개 식별자만 포함한다. 비밀번호는 Infisical에 보관한다.
-Infisical 액션은 CI 전용 프로젝트의 루트 값을 환경변수로 전달하므로 해당 프로젝트에는 CI에 허용한 값만 둔다.
-액션 저장소가 공개여도 허용되지 않은 GitHub 저장소는 서버 측 인증을 통과할 수 없다.
+- 지정한 디렉터리의 Git 추적 `.yaml`·`.yml` 파일만 처리한다.
+- Deployment·StatefulSet·DaemonSet·Job·CronJob의 containers와 initContainers를 지원한다.
+- 이미지의 레지스트리·저장소 이름을 정확히 비교해 태그 또는 digest를 새 태그로 바꾼다. 같은 이미지를 쓰는 migration Job도 함께 갱신한다.
+- 입력한 이미지 중 하나라도 없거나 YAML이 잘못되면 파일을 쓰기 전에 실패한다.
+- 다른 이미지·환경변수·pull Secret은 유지한다. OCIR 전환 같은 일회성 정리는 수행하지 않는다.
+- 변경 파일의 YAML 서식과 주석은 PyYAML 직렬화로 정규화된다. 변경 없는 파일은 다시 쓰지 않는다.
+- 변경이 없으면 커밋하지 않는다. 동시 push 충돌은 rebase 후 최대 세 번 push하며, 실제 충돌이면 실패한다. 강제 push는 하지 않는다.
+- 호스트를 바꾸면 기존 매니페스트의 이미지 이름도 새 레지스트리로 이전해야 한다. 다른 호스트의 이미지를 추측해서 바꾸지 않는다.
 
-## 출력
+## 환경변수와 인증
 
-`registry` 출력은 `registry.deer-deneb.ts.net`이다.
-사용할 때 액션 step에 `id: registry`를 지정하고 `${{ steps.registry.outputs.registry }}`로 읽을 수 있다.
+Infisical `github-ci / prod / /`에 저장한다.
+
+| 키 | 용도 |
+| --- | --- |
+| `DOCKER_REGISTRY_HOST` | 레지스트리 호스트. 선택적으로 포트 포함 |
+| `DOCKER_REGISTRY_PASSWORD` | 레지스트리 `ci-push` 계정 비밀번호 |
+| `MANIFEST_UPDATE_TOKEN` | 인프라 저장소 읽기·쓰기 PAT |
+
+**load-env 또는 루트 로그인 액션 이후 같은 job의 모든 step에서 환경변수가 유지된다.**
+Infisical 액션의 `export-type: env`로 루트 Secret 전체를 가져온다. 하위 폴더와 import는 포함하지 않는다.
+`run`에서는 `$DOCKER_REGISTRY_HOST`, 액션의 `with`에서는 `${{ env.DOCKER_REGISTRY_HOST }}`를 사용한다.
+`${{ secrets.* }}`로 GitHub Secret에 자동 등록되는 것은 아니다.
+
+job 간에는 전달되지 않으므로 각 job에서 load-env를 호출한다. 다음 실행 때 다시 읽으며 실행 중 자동 갱신하지 않는다.
+값을 확인하기 위해 `echo`나 `printenv`로 Secret을 출력하지 않는다.
+
+현재 OIDC 조건은 Linux runner, owner `saturn30` 또는 `bluesoft9999`, ref `refs/tags/v*`다.
+호출 job에 `id-token: write`가 필요하다. Infisical·Tailscale 서버 측 신뢰 조건도 같은 범위를 허용해야 한다.
+공개 저장소의 코드를 호출할 수 있다는 것이 Secret 접근 권한을 의미하지는 않는다.
+
+Infisical Identity ID는 `8d988eed-4b7b-460a-a1c9-1b682b1e2336`, audience는 `github-ci`다.
+Tailscale client는 caller owner에 따라 선택하고 `tag:ci-registry`로 연결한다.
+job 종료 시 내부 액션의 post 처리로 Docker 로그아웃과 Tailscale 정리를 수행한다.
 
 ## 버전과 검증
 
-`@v1`은 호환되는 수정 사항을 받는 주요 버전 태그다. 고정하려면 특정 릴리스 태그나 커밋 SHA를 사용한다.
-중첩된 외부 액션은 검토한 커밋 SHA로 고정한다.
-
-인증 검증 workflow는 수동 실행 전용이다. GitHub CLI에서:
+`v1`은 검증 후 갱신하는 주요 버전 태그다. 재현하려면 릴리스 태그나 커밋 SHA로 고정한다.
+루트 액션 내부 load-env 참조도 검증된 SHA로 고정하므로 load-env 구현을 바꿀 때 그 참조를 함께 갱신한다.
 
 ```sh
+python3 -m pip install -r update-manifests/requirements.txt
+python3 -m unittest discover -s tests -v
 gh workflow run verify.yml --repo saturn30/registry-login-action --ref v1
 ```
 
-검증은 실제 Infisical OIDC, Tailscale 연결, Docker 로그인 및 기존 이미지 manifest 조회를 수행한다.
-테스트 이미지 verification/cuda가 레지스트리에 있어야 한다. 이미지를 생성하거나 삭제하지 않는다.
+수동 검증은 Infisical 로딩·Tailscale·Docker 로그인 후 인프라 저장소에 임시 브랜치를 만들어
+공통 액션의 실제 커밋·push와 재실행 시 커밋 생략을 확인한다. 임시 브랜치는 종료 시 삭제한다.
+운영 main, 이미지 게시, 앱 배포는 변경하지 않는다. 임시 브랜치의 workload 이미지 태그는 검증용 값이다.
 
-GitOps 토큰도 확인하려면 `verify-gitops` 입력을 포함한 최신 workflow가 들어 있는 `v*` 태그에서
-해당 입력을 `true`로 실행한다. Infisical의 `MANIFEST_UPDATE_TOKEN`으로
-`bluesoft9999/netcup-infra` checkout과 `git push --dry-run`을 확인한다. 이 모드에서는
-기존 CUDA 테스트 이미지 조회를 건너뛰므로 해당 이미지의 보존 여부에 의존하지 않는다.
-토큰 값은 출력하지 않으며 실제 브랜치 생성·매니페스트 변경·배포는 수행하지 않는다.
-dry-run은 push 인증 확인이며, main 브랜치 보호 규칙을 통과하는 실제 쓰기까지 검증한 것은 아니다.
+현재 릴리스는 `v1.1.0`이다. 2026-09-19 [실제 CI 검증](https://github.com/saturn30/registry-login-action/actions/runs/35438702321)에서 환경변수 로딩·로그인·임시 브랜치 갱신·재실행 무변경·임시 브랜치 삭제까지 통과했다.
